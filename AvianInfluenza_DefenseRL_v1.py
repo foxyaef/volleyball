@@ -1,0 +1,185 @@
+"""수비 강화학습 모델의 단일 파일 출력 템플릿.
+
+구조
+1. POLICY_WEIGHTS: 학습기가 넣는 5개 행동 × 19개 상태 특징 가중치.
+2. _advance_ball/_predict: 실제 물리로 머리 높이 수신 X와 시간을 예측.
+3. _features: 스냅샷과 예측값을 학습 모델 입력 19개로 변환.
+4. _argmax_policy: 정지/달리기/다이빙 중 가장 높은 점수의 행동 선택.
+5. decide: RIGHT를 LEFT 좌표로 대칭 변환한 뒤 결과 방향을 복원.
+
+train.py는 가중치 자리만 숫자로 치환하므로 재학습해도 설명이 유지된다.
+"""
+
+# 학습 시 5×19 숫자 배열로 교체되는 부분이다.
+POLICY_WEIGHTS = [[0.84940867, 0.27057915, -3.48288544, -0.11773981, 1.10639064, 0.22705244, -0.65606304, -0.48936588, -0.45154819, 0.96058214, 0.42102709, 0.06463707, -0.96173947, 0.08546568, -0.01502554, 0.08044657, 0.87272361, -0.09440676, -0.37343498], [-0.48845005, -3.27540635, 0.34038936, 0.24503324, -0.40354381, -3.24548326, -0.34641743, 0.89620749, 0.05615232, -0.31795378, -0.59264163, -0.22194084, 1.02408121, 0.3387945, 1.58601352, -0.22278008, 0.37354021, 0.00013172, 0.49984656], [-0.43943807, 3.47675766, -0.23814457, -0.32300889, 0.1548834, 4.03331378, -0.23551232, 0.02303949, -0.81257965, -0.6842091, 0.72810324, -0.15488465, -1.29591661, 0.35184153, 0.09766597, 0.72063186, -0.15443332, 0.44934214, 0.0700884], [-2.49842439, -3.51744283, 0.21499298, -0.86883239, 1.32873084, -3.98594335, -0.30082842, 4.18349484, 0.23271658, 0.01349672, 0.74253386, 0.63945663, -0.41238384, 1.76658086, -3.90432956, -5.3921739, -4.19661189, -0.28839274, -0.38097206], [-2.50592508, 2.50045307, -0.01762539, -0.68391552, 0.96037729, 4.20182036, -0.27175267, 4.74279112, -0.03780418, 0.13324605, -0.77713596, -0.26794036, 0.21069986, 1.6639524, -4.26105428, -5.25888386, -3.61540687, -0.24157839, -0.31271014]]
+
+GROUND_WIDTH = 432.0
+NET_X = 216.0
+GROUND_Y = 252.0
+PLAYER_GROUND_Y = 244.0
+PLAYER_HALF = 32.0
+PLAYER_MIN = 32.0
+PLAYER_MAX = 184.0
+PLAYER_SPEED = 6.0
+BALL_MAX_Y_SPEED = 40.0
+NET_HALF_WIDTH = 25.0
+NET_TOP_Y = 176.0
+NET_CAP_BOTTOM_Y = 192.0
+HEAD_Y = 212.0
+
+_last_canonical_direction = 0
+_last_rally_frame = -1
+
+
+def _clamp(value, low, high):
+    """값을 물리 또는 특징의 허용 범위 안으로 제한한다."""
+    return max(low, min(high, value))
+
+
+def _number(value, fallback=0.0):
+    """누락되거나 비정상적인 스냅샷 필드를 안전하게 숫자로 읽는다."""
+    try:
+        value = float(value)
+        return fallback if value != value else value
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _advance_ball(x, y, vx, vy):
+    """플레이어 충돌을 제외한 공 물리를 실제 엔진 순서로 1프레임 진행한다."""
+    vy = _clamp(vy, -BALL_MAX_Y_SPEED, BALL_MAX_Y_SPEED)
+    if x + vx < 0.0 or x + vx > GROUND_WIDTH:
+        vx = -vx
+    if y + vy < 0.0:
+        vy = 1.0
+    if abs(x - NET_X) < NET_HALF_WIDTH and y > NET_TOP_Y:
+        if y <= NET_CAP_BOTTOM_Y:
+            if vy > 0.0:
+                vy = -vy
+        elif x < NET_X:
+            vx = -abs(vx)
+        else:
+            vx = abs(vx)
+    next_y = y + vy
+    if next_y > GROUND_Y:
+        return x, GROUND_Y, vx, -vy, True
+    return x + vx, next_y, vx, vy + 1.0, False
+
+
+def _predict(x, y, vx, vy):
+    """공이 서 있는 봇의 머리 높이에 도착할 (X, 남은 프레임)을 찾는다."""
+    for eta in range(1, 241):
+        old_y = y
+        x, y, vx, vy, ground = _advance_ball(x, y, vx, vy)
+        if y > old_y and y >= HEAD_Y and 0.0 <= x <= NET_X:
+            return _clamp(x, PLAYER_MIN, PLAYER_MAX), eta
+        if ground:
+            return None
+    return None
+
+
+def _features(self_x, state, ball_x, ball_y, ball_vx, ball_vy):
+    """현재 물리 상태를 학습 정책이 사용하는 정규화 특징 19개로 바꾼다."""
+    prediction = _predict(ball_x, ball_y, ball_vx, ball_vy)
+    if prediction is None:
+        target_x, eta = self_x, 30
+    else:
+        target_x, eta = prediction
+    dx = target_x - self_x
+    useful_frames = max(1.0, eta - 1.0)
+    required = dx / (PLAYER_SPEED * useful_frames)
+    normal_gap = abs(dx) - PLAYER_SPEED * useful_frames - PLAYER_HALF
+    last = float(_last_canonical_direction)
+    toward = 1.0 if dx * last > 0.0 else (-1.0 if dx * last < 0.0 else 0.0)
+    return [
+        1.0,
+        _clamp(dx / 96.0, -2.0, 2.0),
+        _clamp(abs(dx) / 96.0, 0.0, 2.0),
+        _clamp(eta / 24.0, 0.0, 2.0),
+        1.0 / max(1.0, eta / 4.0),
+        _clamp(required, -2.0, 2.0),
+        _clamp(abs(required), 0.0, 2.0),
+        _clamp(normal_gap / 48.0, -2.0, 2.0),
+        last,
+        toward,
+        (self_x - 108.0) / 76.0,
+        _clamp(ball_vx / 40.0, -2.0, 2.0),
+        _clamp(ball_vy / 40.0, -1.0, 1.0),
+        1.0 if state == 0 else 0.0,
+        1.0 if state in (1, 2) else 0.0,
+        1.0 if state == 3 else 0.0,
+        1.0 if state == 4 else 0.0,
+        _clamp((56.0 - self_x) / 24.0, 0.0, 1.0),
+        _clamp((self_x - 160.0) / 24.0, 0.0, 1.0),
+    ]
+
+
+def _argmax_policy(features, state):
+    """가중합 점수가 최대인 행동을 고르고 현재 불가능한 다이빙은 제외한다."""
+    best_action = 0
+    best_score = -1.0e100
+    for action, row in enumerate(POLICY_WEIGHTS):
+        if state != 0 and action >= 3:
+            continue
+        score = 0.0
+        for weight, feature in zip(row, features):
+            score += weight * feature
+        if score > best_score:
+            best_score = score
+            best_action = action
+    return best_action
+
+
+def decide(s):
+    """수비 진입점: 점프/공격 없이 학습된 정지·달리기·다이빙을 반환한다."""
+    global _last_canonical_direction, _last_rally_frame
+
+    side = s.get('side', 'LEFT')
+    me = s.get('self', {})
+    ball = s.get('ball', {})
+    meta = s.get('meta', {})
+    rally = int(_number(meta.get('rallyFrameCount'), 0))
+    if rally < _last_rally_frame or rally <= 1:
+        _last_canonical_direction = 0
+    _last_rally_frame = rally
+
+    # Mirror RIGHT into the LEFT coordinate system used during training.
+    mirror = -1 if side == 'RIGHT' else 1
+    self_x_raw = _number(me.get('x'), 108 if side == 'LEFT' else 324)
+    ball_x_raw = _number(ball.get('x'))
+    self_x = GROUND_WIDTH - self_x_raw if mirror == -1 else self_x_raw
+    ball_x = GROUND_WIDTH - ball_x_raw if mirror == -1 else ball_x_raw
+    ball_vx = _number(ball.get('xVelocity')) * mirror
+    ball_y = _number(ball.get('y'))
+    ball_vy = _number(ball.get('yVelocity'))
+    state = int(_number(me.get('state'), 0))
+
+    landing_raw = _number(ball.get('expectedLandingPointX'), -9999.0)
+    landing = GROUND_WIDTH - landing_raw if mirror == -1 else landing_raw
+    incoming = 0.0 <= landing <= NET_X
+
+    if incoming:
+        action = _argmax_policy(
+            _features(self_x, state, ball_x, ball_y, ball_vx, ball_vy), state
+        )
+    else:
+        # No threat: recover to the canonical centre so the next randomized
+        # attack starts from the most useful position.
+        dx = 108.0 - self_x
+        action = 2 if dx > 6.0 else (1 if dx < -6.0 else 0)
+
+    if action == 1:
+        canonical_x, hit = -1, 0
+    elif action == 2:
+        canonical_x, hit = 1, 0
+    elif action == 3:
+        canonical_x, hit = -1, 1
+    elif action == 4:
+        canonical_x, hit = 1, 1
+    else:
+        canonical_x, hit = 0, 0
+
+    if state != 0:
+        hit = 0
+    _last_canonical_direction = canonical_x
+    return {'x': int(canonical_x * mirror), 'y': 0, 'hit': int(hit)}
