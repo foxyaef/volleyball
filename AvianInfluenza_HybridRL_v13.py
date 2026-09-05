@@ -643,8 +643,11 @@ def basic_attack_candidate(s):
     }
 
     # # fast_down 공격을 실제로 타격하는 순간에만 스킬 사용
-    # if pattern_name == 'fast_down' and action['hit'] == 1:
-    #     action['skill'] = 1
+    if pattern_name == 'fast_flat' and action['hit'] == 1:
+        action['hit']=0
+    if pattern_name == 'fast_up' and action['hit'] == 1:
+        action['hit']=0
+    action['skillX'] = opp_x_raw
 
     return {
         'name': 'diverse_attack_v13_' + pattern_name,
